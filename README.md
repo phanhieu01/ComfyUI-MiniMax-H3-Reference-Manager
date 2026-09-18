@@ -1,6 +1,10 @@
 # ComfyUI MiniMax H3 Reference Manager
 
-Standalone MiniMax H3 reference-conditioning node for ComfyUI.
+MiniMax H3 reference-management nodes for ComfyUI.
+
+Use **MiniMax H3 Reference Bundle** outside a subgraph to collect references,
+then connect its `reference_bundle` output to **MiniMax H3 Reference Manager**
+inside the H3 conditioning workflow.
 
 ## Features
 
