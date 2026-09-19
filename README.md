@@ -23,15 +23,24 @@ inside the H3 conditioning workflow.
   for each paired soundtrack. Audio ordinals are displayed in the same order
   used by H3: paired soundtracks follow video presentation order, then
   standalone audio continues the numbering.
-- The summary also provides local previews: image thumbnails, video controls,
-  and audio controls (including audio extracted from a selected video).
+- Each selected image, video, and audio reference has a local preview directly
+  below its own input slot. Paired audio previews use the selected video's
+  soundtrack.
+- File selectors refresh automatically after an upload. Use **Refresh files**
+  when a file was copied into `ComfyUI/input` outside the node; restarting the
+  server is not required.
+- When **Generate audio without references** is enabled, both audio-reference
+  groups are hidden and their old values are ignored during execution.
 - Uploaded files are decoded by the bundle node into the native H3 reference tensors.
-- In a two-phase H3 workflow, **MiniMax H3 Reference Video Preprocessor** applies
-  the shared FPS, frame cap, and exact connected Phase-1 width/height to every enabled video slot.
-  All processed videos remain equal members of the bundle; there is no separate
-  `source_video` or `VHS_LoadVideo` path. The workflow chooses canvas aspect
-  ratio explicitly; the optional layout-image output is not part of the sizing
-  dependency, avoiding a circular graph.
+- In a two-phase H3 workflow, the existing **VHS Load Video** nodes receive the
+  Phase-1-derived width and height, then center-crop and resize each reference
+  video before it reaches H3. The short edge is kept between 480 and 704 pixels
+  on the 32-pixel H3 grid.
+- Phase 2 uses the official **MiniMax H3 Reference to Video** node with its video
+  inputs left unconnected. Paired soundtracks are routed through its standalone
+  audio-reference inputs, so Phase 2 does not condition on the motion reference.
+- The workflow does not add custom conditioning or resolution nodes; it reuses
+  the official H3 node and existing ComfyUI/VHS nodes.
 - Paired audio selectors reject duplicates, disabled video slots, and videos
   without a decodable audio track so prompt ordinals cannot silently drift.
 - Prompt tags are checked against the active bundle before conditioning.
@@ -48,6 +57,9 @@ ComfyUI/custom_nodes/ComfyUI-MiniMax-H3-Reference-Manager
 ```
 
 Restart ComfyUI and search for **MiniMax H3 Reference Manager (9/3/3/3)**.
+
+The tested two-phase workflow is included at
+`workflows/minimax_h3_two_phase_socket_refs.json`.
 
 The node requires a ComfyUI build that provides `comfy_api.latest` and the
 native MiniMax H3 nodes. No extra Python packages are required.

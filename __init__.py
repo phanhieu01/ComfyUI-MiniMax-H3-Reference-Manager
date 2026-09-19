@@ -9,14 +9,17 @@ import math
 import os
 import re
 
+from aiohttp import web
+
 import folder_paths
 import nodes
 import torch
-import torch.nn.functional as F
+import comfy.utils
 from comfy_api.latest import InputImpl
 from comfy_extras.nodes_audio import load as load_audio
 from comfy_api.latest import io
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo
+from server import PromptServer
 
 WEB_DIRECTORY = "./js"
 
@@ -28,16 +31,137 @@ def _files(content_types):
     return [""] + sorted(folder_paths.filter_files_content_types(files, content_types))
 
 
-IMAGE_FILES = _files(["image"])
-VIDEO_FILES = _files(["video"])
-AUDIO_FILES = _files(["audio", "video"])
 VIDEO_AUDIO_SOURCES = ["", "Video reference 1", "Video reference 2", "Video reference 3"]
+
+REFERENCE_VIDEO_MIN_SHORT_EDGE = 480
+REFERENCE_VIDEO_MAX_SHORT_EDGE = 720
+REFERENCE_VIDEO_MULTIPLE = 32
 
 REFERENCE_TAG_RE = re.compile(r"<(Picture|Video|Audio)\s+(\d+)>", re.IGNORECASE)
 
 
+@PromptServer.instance.routes.get("/minimax_h3_reference_manager/files")
+async def _reference_manager_files(request):
+    return web.json_response({
+        "image": _files(["image"]),
+        "video": _files(["video"]),
+        "audio": _files(["audio", "video"]),
+    })
+
+
 def _file_value(value):
     return value if isinstance(value, str) and value else None
+
+
+def _audio_generation_enabled(value):
+    return value is True or value == "true" or value == 1 or value == "1"
+
+
+def _reference_video_canvas(phase1_width, phase1_height):
+    """Return an H3-grid canvas derived from the selected Phase-1 canvas."""
+    phase1_width = max(REFERENCE_VIDEO_MULTIPLE, int(phase1_width or 0))
+    phase1_height = max(REFERENCE_VIDEO_MULTIPLE, int(phase1_height or 0))
+    phase1_short_edge = min(phase1_width, phase1_height)
+    short_edge = min(
+        REFERENCE_VIDEO_MAX_SHORT_EDGE,
+        max(REFERENCE_VIDEO_MIN_SHORT_EDGE, phase1_short_edge),
+    )
+    short_edge = max(
+        REFERENCE_VIDEO_MULTIPLE,
+        (short_edge // REFERENCE_VIDEO_MULTIPLE) * REFERENCE_VIDEO_MULTIPLE,
+    )
+    scale = short_edge / phase1_short_edge
+    width = max(
+        REFERENCE_VIDEO_MULTIPLE,
+        math.floor(phase1_width * scale / REFERENCE_VIDEO_MULTIPLE) * REFERENCE_VIDEO_MULTIPLE,
+    )
+    height = max(
+        REFERENCE_VIDEO_MULTIPLE,
+        math.floor(phase1_height * scale / REFERENCE_VIDEO_MULTIPLE) * REFERENCE_VIDEO_MULTIPLE,
+    )
+    return width, height
+
+
+def _validate_reference_file(value, label, content_types):
+    value = _file_value(value)
+    if value is None:
+        return True
+    if not folder_paths.exists_annotated_filepath(value):
+        return f"{label} file is not available in the ComfyUI input folders: {value}"
+    try:
+        path = folder_paths.get_annotated_filepath(value)
+    except ValueError:
+        return f"{label} has an invalid file path: {value}"
+    if not os.path.isfile(path):
+        return f"{label} is not a file: {value}"
+    if not folder_paths.filter_files_content_types([os.path.basename(path)], content_types):
+        return f"{label} has an unsupported file type: {value}"
+    return True
+
+
+def _validate_reference_inputs(values):
+    try:
+        image_count = int(values.get("image_reference_count", 0))
+        video_count = int(values.get("video_reference_count", 0))
+        video_audio_count = int(values.get("video_audio_reference_count", 0))
+        audio_count = int(values.get("audio_reference_count", 0))
+    except (TypeError, ValueError):
+        return "Reference counts must be whole numbers."
+
+    limits = (
+        ("image_reference_count", image_count, 9),
+        ("video_reference_count", video_count, 3),
+        ("video_audio_reference_count", video_audio_count, 3),
+        ("audio_reference_count", audio_count, 3),
+    )
+    for name, count, maximum in limits:
+        if count < 0 or count > maximum:
+            return f"{name} must be between 0 and {maximum}."
+
+    for index in range(image_count):
+        result = _validate_reference_file(
+            values.get(f"ref_image_{index}"),
+            f"Image reference {index + 1}",
+            ["image"],
+        )
+        if result is not True:
+            return result
+
+    for index in range(video_count):
+        result = _validate_reference_file(
+            values.get(f"ref_video_{index}"),
+            f"Video reference {index + 1}",
+            ["video"],
+        )
+        if result is not True:
+            return result
+
+    if _audio_generation_enabled(values.get("generate_audio_without_reference")):
+        return True
+
+    for index in range(audio_count):
+        result = _validate_reference_file(
+            values.get(f"ref_audio_{index}"),
+            f"Audio reference {index + 1}",
+            ["audio", "video"],
+        )
+        if result is not True:
+            return result
+
+    effective_video_audio_count = min(video_audio_count, video_count)
+    selected_sources = set()
+    for index in range(effective_video_audio_count):
+        source = values.get(f"ref_video_audio_{index}")
+        video_index = _video_source_index(source)
+        if video_index is None or video_index >= video_count:
+            return (
+                f"Video-paired audio {index + 1} must select an enabled "
+                f"video reference (1-{video_count})."
+            )
+        if video_index in selected_sources:
+            return f"Video reference {video_index + 1} is selected more than once as paired audio."
+        selected_sources.add(video_index)
+    return True
 
 
 def _load_image_file(value):
@@ -226,12 +350,12 @@ class MiniMaxH3ReferenceBundle(io.ComfyNode):
                         "a new soundtrack. Audio reference controls are hidden in the UI."
                     ),
                 ),
-                *_upload_inputs("ref_image_", "Image reference", IMAGE_FILES, io.UploadType.image, 9,
+                *_upload_inputs("ref_image_", "Image reference", _files(["image"]), io.UploadType.image, 9,
                                 "Choose or upload an image reference directly in this node."),
-                *_upload_inputs("ref_video_", "Video reference", VIDEO_FILES, io.UploadType.video, 3,
+                *_upload_inputs("ref_video_", "Video reference", _files(["video"]), io.UploadType.video, 3,
                                 "Choose or upload a video reference directly in this node."),
                 *_video_audio_inputs(3),
-                *_upload_inputs("ref_audio_", "Audio reference", AUDIO_FILES, io.UploadType.audio, 3,
+                *_upload_inputs("ref_audio_", "Audio reference", _files(["audio", "video"]), io.UploadType.audio, 3,
                                 "Choose or upload a standalone audio reference directly in this node."),
             ],
             outputs=[
@@ -261,7 +385,7 @@ class MiniMaxH3ReferenceBundle(io.ComfyNode):
             "Image references",
         )
         _require_contiguous_slots(video_values, active_video_count, "Video references")
-        if generate_audio_without_reference:
+        if _audio_generation_enabled(generate_audio_without_reference):
             video_audio_reference_count = "0"
             audio_reference_count = "0"
         else:
@@ -349,7 +473,8 @@ class MiniMaxH3ReferenceBundle(io.ComfyNode):
             "video_fps": video_fps,
             "ref_video_audios": ref_video_audios,
             "ref_audios": ref_audios,
-            "generate_audio_without_reference": bool(generate_audio_without_reference),
+            "generate_audio_without_reference": _audio_generation_enabled(
+                generate_audio_without_reference),
             "presentation_order": presentation_order,
             "audio_reference_order": audio_reference_order,
             "reference_order": {
@@ -362,6 +487,10 @@ class MiniMaxH3ReferenceBundle(io.ComfyNode):
         bundle["has_references"] = any(bundle[key] for key in (
             "ref_images", "ref_videos", "ref_video_audios", "ref_audios"))
         return io.NodeOutput(bundle)
+
+    @classmethod
+    def validate_inputs(cls, **kwargs):
+        return _validate_reference_inputs(kwargs)
 
 
 class MiniMaxH3ReferenceInputManager(io.ComfyNode):
@@ -424,12 +553,12 @@ class MiniMaxH3ReferenceInputManager(io.ComfyNode):
                     default=False,
                     display_name="Generate audio without references",
                 ),
-                *_upload_inputs("ref_image_", "Image reference", IMAGE_FILES, io.UploadType.image, 9,
+                *_upload_inputs("ref_image_", "Image reference", _files(["image"]), io.UploadType.image, 9,
                                 "Filename is forwarded to the matching loader inside the subgraph."),
-                *_upload_inputs("ref_video_", "Video reference", VIDEO_FILES, io.UploadType.video, 3,
+                *_upload_inputs("ref_video_", "Video reference", _files(["video"]), io.UploadType.video, 3,
                                 "Filename is forwarded to the matching VHS loader inside the subgraph."),
                 *_video_audio_inputs(3),
-                *_upload_inputs("ref_audio_", "Audio reference", AUDIO_FILES, io.UploadType.audio, 3,
+                *_upload_inputs("ref_audio_", "Audio reference", _files(["audio", "video"]), io.UploadType.audio, 3,
                                 "Filename is forwarded to the matching VHS audio loader inside the subgraph."),
             ],
             outputs=outputs,
@@ -455,22 +584,45 @@ class MiniMaxH3ReferenceInputManager(io.ComfyNode):
 
         image_count = max(0, min(int(image_reference_count), 9))
         video_count = max(0, min(int(video_reference_count), 3))
-        video_audio_count = max(0, min(int(video_audio_reference_count), 3, video_count))
-        audio_count = max(0, min(int(audio_reference_count), 3))
-        image_paths = [selected_path(value) for value in (
+        audio_without_reference = _audio_generation_enabled(generate_audio_without_reference)
+        if audio_without_reference:
+            video_audio_count = 0
+            audio_count = 0
+        else:
+            video_audio_count = max(0, min(int(video_audio_reference_count), 3, video_count))
+            audio_count = max(0, min(int(audio_reference_count), 3))
+        image_values = (
             ref_image_0, ref_image_1, ref_image_2, ref_image_3, ref_image_4,
             ref_image_5, ref_image_6, ref_image_7, ref_image_8,
-        )]
-        video_paths = [selected_path(value) for value in (ref_video_0, ref_video_1, ref_video_2)]
+        )
+        image_paths = [
+            selected_path(value) if index < image_count else ""
+            for index, value in enumerate(image_values)
+        ]
+        video_values = (ref_video_0, ref_video_1, ref_video_2)
+        video_paths = [
+            selected_path(value) if index < video_count else ""
+            for index, value in enumerate(video_values)
+        ]
         # Paired audio is selected from an already-loaded reference video; no
         # second upload is needed.  Return one-based source indices (0 means
         # disabled) so the subgraph can route the native VHS audio outputs.
-        video_audio_sources = []
-        for value in (ref_video_audio_0, ref_video_audio_1, ref_video_audio_2):
-            source_index = _video_source_index(value)
-            source_number = source_index + 1 if source_index is not None else 0
-            video_audio_sources.append(source_number if source_number <= video_count else 0)
-        audio_paths = [selected_path(value) for value in (ref_audio_0, ref_audio_1, ref_audio_2)]
+        if audio_without_reference:
+            video_audio_sources = [0, 0, 0]
+            audio_paths = ["", "", ""]
+        else:
+            video_audio_sources = []
+            for index, value in enumerate((ref_video_audio_0, ref_video_audio_1, ref_video_audio_2)):
+                if index >= video_audio_count:
+                    video_audio_sources.append(0)
+                    continue
+                source_index = _video_source_index(value)
+                source_number = source_index + 1 if source_index is not None else 0
+                video_audio_sources.append(source_number if source_number <= video_count else 0)
+            audio_paths = [
+                selected_path(value) if index < audio_count else ""
+                for index, value in enumerate((ref_audio_0, ref_audio_1, ref_audio_2))
+            ]
         return io.NodeOutput(
             image_count,
             video_count,
@@ -480,8 +632,12 @@ class MiniMaxH3ReferenceInputManager(io.ComfyNode):
             *video_paths,
             *video_audio_sources,
             *audio_paths,
-            bool(generate_audio_without_reference),
+            audio_without_reference,
         )
+
+    @classmethod
+    def validate_inputs(cls, **kwargs):
+        return _validate_reference_inputs(kwargs)
 
 
 def _preprocess_reference_frames(frames, source_fps, target_fps, frame_load_cap,
@@ -528,8 +684,8 @@ def _preprocess_reference_frames(frames, source_fps, target_fps, frame_load_cap,
             new_height = max(32, int(round(height * scale / 32.0)) * 32)
         if new_width != width or new_height != height:
             nchw = frames.permute(0, 3, 1, 2)
-            nchw = F.interpolate(nchw, size=(new_height, new_width),
-                                 mode="bilinear", align_corners=False)
+            nchw = comfy.utils.common_upscale(
+                nchw, new_width, new_height, "bilinear", "center")
             frames = nchw.permute(0, 2, 3, 1).contiguous()
     return frames
 
@@ -545,7 +701,8 @@ class MiniMaxH3ReferenceVideoPreprocessor(io.ComfyNode):
             category="model/conditioning/minimax",
             description=(
                 "Apply one shared FPS, frame cap, and the connected Phase-1 "
-                "width/height to every video in the Reference Manager bundle."
+                "width/height to every video in the Reference Manager bundle, "
+                "bounded to the 480-720 short-edge reference-video range."
             ),
             inputs=[
                 io.AnyType.Input("reference_bundle", optional=True),
@@ -574,6 +731,8 @@ class MiniMaxH3ReferenceVideoPreprocessor(io.ComfyNode):
 
         target_width = max(0, int(target_width or 0))
         target_height = max(0, int(target_height or 0))
+        if target_width > 0 and target_height > 0:
+            target_width, target_height = _reference_video_canvas(target_width, target_height)
         target_megapixels = max(
             0.5, min(float(final_megapixels or 0.0) * float(phase1_scale or 0.0), 1.0)
         )
