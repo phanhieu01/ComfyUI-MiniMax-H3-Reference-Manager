@@ -5,8 +5,8 @@ const NODE_NAME = "MiniMaxH3ReferenceBundle";
 const GROUPS = [
   { count: "image_reference_count", prefix: "ref_image_", max: 9 },
   { count: "video_reference_count", prefix: "ref_video_", max: 3 },
-  { count: "video_audio_reference_count", prefix: "ref_video_audio_", max: 3 },
-  { count: "audio_reference_count", prefix: "ref_audio_", max: 3 },
+  { count: "video_audio_reference_count", prefix: "ref_video_audio_", max: 3, audioOnly: true },
+  { count: "audio_reference_count", prefix: "ref_audio_", max: 3, audioOnly: true },
 ];
 
 function countValue(node, name, max) {
@@ -17,6 +17,39 @@ function countValue(node, name, max) {
 
 function valueFor(node, name) {
   return (node.widgets || []).find((candidate) => candidate.name === name)?.value ?? "";
+}
+
+function audioReferencesDisabled(node) {
+  const value = valueFor(node, "generate_audio_without_reference");
+  return value === true || value === "true" || value === 1 || value === "1";
+}
+
+function pairedAudioByVideo(node) {
+  if (audioReferencesDisabled(node)) return { entries: [], warnings: [] };
+  const videoCount = countValue(node, "video_reference_count", 3);
+  const selectionCount = countValue(node, "video_audio_reference_count", 3);
+  const selected = new Map();
+  const warnings = [];
+  for (let slot = 0; slot < selectionCount; slot += 1) {
+    const source = String(valueFor(node, `ref_video_audio_${slot}`) || "");
+    const match = source.match(/Video reference (\d+)/);
+    const videoIndex = match ? Number(match[1]) - 1 : -1;
+    if (videoIndex < 0 || videoIndex >= videoCount) {
+      warnings.push(`Paired audio slot ${slot + 1}: select an enabled video reference`);
+      continue;
+    }
+    if (selected.has(videoIndex)) {
+      warnings.push(`Video ${videoIndex + 1} audio is selected more than once`);
+      continue;
+    }
+    selected.set(videoIndex, { slot, videoIndex, source });
+  }
+  // H3 emits paired <Audio N> items in video presentation order, regardless
+  // of the order in which the selector slots were filled.
+  return {
+    entries: [...selected.values()].sort((a, b) => a.videoIndex - b.videoIndex),
+    warnings,
+  };
 }
 
 function shortValue(value) {
@@ -82,23 +115,23 @@ function updateMediaPreview(node) {
 
   const imageCount = countValue(node, "image_reference_count", 9);
   const videoCount = countValue(node, "video_reference_count", 3);
-  const videoAudioCount = countValue(node, "video_audio_reference_count", 3);
-  const audioCount = countValue(node, "audio_reference_count", 3);
+  const noAudioReferences = audioReferencesDisabled(node);
+  const audioCount = noAudioReferences ? 0 : countValue(node, "audio_reference_count", 3);
   for (let index = 0; index < imageCount; index += 1) {
     addPreview(container, `Image ${index + 1}`, valueFor(node, `ref_image_${index}`), "image");
   }
   for (let index = 0; index < videoCount; index += 1) {
     addPreview(container, `Video ${index + 1}`, valueFor(node, `ref_video_${index}`), "video");
   }
-  for (let index = 0; index < videoAudioCount; index += 1) {
-    const source = valueFor(node, `ref_video_audio_${index}`);
-    const sourceMatch = String(source).match(/Video reference (\d+)/);
-    const sourceIndex = sourceMatch ? Number(sourceMatch[1]) - 1 : -1;
-    const sourceFile = sourceIndex >= 0 ? valueFor(node, `ref_video_${sourceIndex}`) : "";
-    addPreview(container, `Audio ${index + 1}`, sourceFile, "audio");
+  let audioOrdinal = 0;
+  for (const entry of pairedAudioByVideo(node).entries) {
+    audioOrdinal += 1;
+    const sourceFile = valueFor(node, `ref_video_${entry.videoIndex}`);
+    addPreview(container, `Audio ${audioOrdinal} · Video ${entry.videoIndex + 1}`, sourceFile, "audio");
   }
   for (let index = 0; index < audioCount; index += 1) {
-    addPreview(container, `Audio ${index + 1}`, valueFor(node, `ref_audio_${index}`), "audio");
+    audioOrdinal += 1;
+    addPreview(container, `Audio ${audioOrdinal}`, valueFor(node, `ref_audio_${index}`), "audio");
   }
 }
 
@@ -161,8 +194,8 @@ function updateSummary(node) {
   const lines = ["Selected references:"];
   const imageCount = countValue(node, "image_reference_count", 9);
   const videoCount = countValue(node, "video_reference_count", 3);
-  const videoAudioCount = countValue(node, "video_audio_reference_count", 3);
-  const audioCount = countValue(node, "audio_reference_count", 3);
+  const noAudioReferences = audioReferencesDisabled(node);
+  const audioCount = noAudioReferences ? 0 : countValue(node, "audio_reference_count", 3);
 
   for (let index = 0; index < imageCount; index += 1) {
     lines.push(`Image ${index + 1}: ${shortValue(valueFor(node, `ref_image_${index}`))}`);
@@ -170,16 +203,24 @@ function updateSummary(node) {
   for (let index = 0; index < videoCount; index += 1) {
     lines.push(`Video ${index + 1}: ${shortValue(valueFor(node, `ref_video_${index}`))}`);
   }
-  for (let index = 0; index < videoAudioCount; index += 1) {
-    const source = valueFor(node, `ref_video_audio_${index}`);
-    const sourceMatch = String(source).match(/Video reference (\d+)/);
-    const sourceIndex = sourceMatch ? Number(sourceMatch[1]) - 1 : -1;
-    const sourceFile = sourceIndex >= 0 ? valueFor(node, `ref_video_${sourceIndex}`) : "";
-    const sourceText = source ? `${source}${sourceFile ? ` (${shortValue(sourceFile)})` : " (not loaded)"}` : "—";
-    lines.push(`Video audio ${index + 1}: ${sourceText}`);
-  }
-  for (let index = 0; index < audioCount; index += 1) {
-    lines.push(`Audio ${index + 1}: ${shortValue(valueFor(node, `ref_audio_${index}`))}`);
+  if (noAudioReferences) {
+    lines.push("Audio mode: generate new H3 audio (external audio references disabled)");
+  } else {
+    const paired = pairedAudioByVideo(node);
+    let audioOrdinal = 0;
+    for (const entry of paired.entries) {
+      audioOrdinal += 1;
+      const sourceFile = valueFor(node, `ref_video_${entry.videoIndex}`);
+      lines.push(
+        `Audio ${audioOrdinal} (paired before Video ${entry.videoIndex + 1}): ` +
+        `${entry.source}${sourceFile ? ` (${shortValue(sourceFile)})` : " (not loaded)"}`,
+      );
+    }
+    for (let index = 0; index < audioCount; index += 1) {
+      audioOrdinal += 1;
+      lines.push(`Audio ${audioOrdinal}: ${shortValue(valueFor(node, `ref_audio_${index}`))}`);
+    }
+    for (const warning of paired.warnings) lines.push(`Warning: ${warning}`);
   }
 
   const text = lines.join("\n");
@@ -190,7 +231,14 @@ function updateSummary(node) {
 }
 
 function syncReferenceWidgets(node) {
+  const noAudioReferences = audioReferencesDisabled(node);
   for (const spec of GROUPS) {
+    const countWidget = (node.widgets || []).find((candidate) => candidate.name === spec.count);
+    if (countWidget && spec.audioOnly) {
+      countWidget.hidden = noAudioReferences;
+      countWidget.disabled = noAudioReferences;
+      countWidget.options = { ...(countWidget.options || {}), hidden: noAudioReferences };
+    }
     const wanted = countValue(node, spec.count, spec.max);
     for (let index = 0; index < spec.max; index += 1) {
       const widget = (node.widgets || []).find(
@@ -199,7 +247,7 @@ function syncReferenceWidgets(node) {
       if (!widget) continue;
       // Upload combo remains a real widget; only the selected number of slots
       // is shown to the user.
-      const hidden = index >= wanted;
+      const hidden = index >= wanted || (spec.audioOnly && noAudioReferences);
       widget.hidden = hidden;
       widget.disabled = hidden;
       // Node 2.0 renders visibility from widget.options.hidden.
@@ -234,6 +282,17 @@ function hookCountWidgets(node) {
     };
     widget._h3ReferenceUploadHooked = true;
   }
+  const audioMode = (node.widgets || []).find(
+    (candidate) => candidate.name === "generate_audio_without_reference",
+  );
+  if (audioMode && !audioMode._h3ReferenceUploadHooked) {
+    const callback = audioMode.callback;
+    audioMode.callback = function (value) {
+      if (callback) callback.call(this, value);
+      syncReferenceWidgets(node);
+    };
+    audioMode._h3ReferenceUploadHooked = true;
+  }
 }
 
 function hookReferenceWidgets(node) {
@@ -253,31 +312,6 @@ function hookReferenceWidgets(node) {
       widget._h3ReferenceValueHooked = true;
     }
   }
-}
-
-function renameSourceVideoInput(node) {
-  if (!node) return false;
-  let changed = false;
-  for (const input of node.inputs || []) {
-    if (input?.name === "video" && input.label === "Reference video file") {
-      input.label = "Source motion video";
-      changed = true;
-    }
-  }
-  // A subgraph can expose the same input through its definition/input node.
-  for (const input of node.subgraph?.inputs || []) {
-    if (input?.name === "video" && input.label === "Reference video file") {
-      input.label = "Source motion video";
-      changed = true;
-    }
-  }
-  if (changed) node.setDirtyCanvas?.(true, true);
-  return changed;
-}
-
-function renameSourceVideoInputs() {
-  const graph = app.graph;
-  for (const node of graph?._nodes || []) renameSourceVideoInput(node);
 }
 
 app.registerExtension({
@@ -304,11 +338,5 @@ app.registerExtension({
       syncReferenceWidgets(this);
       return result;
     };
-  },
-  async nodeCreated(node) {
-    renameSourceVideoInput(node);
-  },
-  async afterConfigureGraph() {
-    renameSourceVideoInputs();
   },
 });

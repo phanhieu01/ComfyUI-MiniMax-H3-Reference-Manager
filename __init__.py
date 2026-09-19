@@ -7,6 +7,7 @@ paired video-audios, and 3 standalone audios.
 
 import math
 import os
+import re
 
 import folder_paths
 import nodes
@@ -31,6 +32,8 @@ IMAGE_FILES = _files(["image"])
 VIDEO_FILES = _files(["video"])
 AUDIO_FILES = _files(["audio", "video"])
 VIDEO_AUDIO_SOURCES = ["", "Video reference 1", "Video reference 2", "Video reference 3"]
+
+REFERENCE_TAG_RE = re.compile(r"<(Picture|Video|Audio)\s+(\d+)>", re.IGNORECASE)
 
 
 def _file_value(value):
@@ -148,6 +151,50 @@ def _video_source_index(value):
     return index if 0 <= index < 3 else None
 
 
+def _prepare_prompt(prompt, image_count, video_count, audio_count,
+                    generate_audio_without_reference=False):
+    """Keep prompt ordinals aligned with the exact H3 presentation payload."""
+    prompt = str(prompt or "")
+    if generate_audio_without_reference:
+        # A no-reference-audio render must not leave dangling <Audio N> tags or
+        # copy instructions in the prompt. Preserve the surrounding prose so a
+        # single-line prompt is never accidentally discarded.
+        prompt = re.sub(r"<Audio\s+\d+>", "the generated soundtrack", prompt,
+                        flags=re.IGNORECASE)
+        prompt = re.sub(r"\bfully[_ ]copy\b", "generate_new", prompt,
+                        flags=re.IGNORECASE)
+        prompt = re.sub(r"\breused?\s+unchanged\b", "generated to match the output",
+                        prompt, flags=re.IGNORECASE)
+        prompt = re.sub(r"\baudio\s+reuse\b", "original audio generation", prompt,
+                        flags=re.IGNORECASE)
+        instruction = (
+            "audio_generation_instruction:\n"
+            "Generate original synchronized diegetic audio appropriate to the visual action. "
+            "Do not copy or reference external audio."
+        )
+        if "audio_generation_instruction:" not in prompt.lower():
+            prompt = prompt.rstrip() + "\n\n" + instruction
+
+    limits = {
+        "picture": int(image_count),
+        "video": int(video_count),
+        "audio": int(audio_count),
+    }
+    invalid = []
+    for kind, ordinal_text in REFERENCE_TAG_RE.findall(prompt):
+        ordinal = int(ordinal_text)
+        available = limits[kind.lower()]
+        if ordinal < 1 or ordinal > available:
+            invalid.append(f"<{kind.title()} {ordinal}> (available: {available})")
+    if invalid:
+        raise ValueError(
+            "Prompt reference tag(s) do not match the active MiniMax H3 bundle: "
+            + ", ".join(dict.fromkeys(invalid))
+            + ". H3 numbers Picture, Video, and Audio independently in presentation order."
+        )
+    return prompt
+
+
 class MiniMaxH3ReferenceBundle(io.ComfyNode):
     """Collect uploaded references without loading any H3 models."""
 
@@ -170,6 +217,15 @@ class MiniMaxH3ReferenceBundle(io.ComfyNode):
                                tooltip="Number of audio tracks paired with reference videos (0-3)."),
                 io.Combo.Input("audio_reference_count", options=[str(i) for i in range(4)], default="0",
                                tooltip="Number of standalone audio references to use (0-3)."),
+                io.Boolean.Input(
+                    "generate_audio_without_reference",
+                    default=False,
+                    display_name="Generate audio without references",
+                    tooltip=(
+                        "Ignore all paired and standalone audio references and let H3 generate "
+                        "a new soundtrack. Audio reference controls are hidden in the UI."
+                    ),
+                ),
                 *_upload_inputs("ref_image_", "Image reference", IMAGE_FILES, io.UploadType.image, 9,
                                 "Choose or upload an image reference directly in this node."),
                 *_upload_inputs("ref_video_", "Video reference", VIDEO_FILES, io.UploadType.video, 3,
@@ -178,12 +234,15 @@ class MiniMaxH3ReferenceBundle(io.ComfyNode):
                 *_upload_inputs("ref_audio_", "Audio reference", AUDIO_FILES, io.UploadType.audio, 3,
                                 "Choose or upload a standalone audio reference directly in this node."),
             ],
-            outputs=[io.AnyType.Output("bundle", display_name="reference_bundle")],
+            outputs=[
+                io.AnyType.Output("bundle", display_name="reference_bundle"),
+            ],
         )
 
     @classmethod
     def execute(cls, image_reference_count="2", video_reference_count="1",
                 video_audio_reference_count="1", audio_reference_count="0",
+                generate_audio_without_reference=False,
                 ref_image_0="", ref_image_1="", ref_image_2="", ref_image_3="", ref_image_4="",
                 ref_image_5="", ref_image_6="", ref_image_7="", ref_image_8="",
                 ref_video_0="", ref_video_1="", ref_video_2="",
@@ -202,10 +261,14 @@ class MiniMaxH3ReferenceBundle(io.ComfyNode):
             "Image references",
         )
         _require_contiguous_slots(video_values, active_video_count, "Video references")
-        _require_contiguous_slots(
-            [ref_audio_0, ref_audio_1, ref_audio_2], audio_reference_count,
-            "Standalone audio references",
-        )
+        if generate_audio_without_reference:
+            video_audio_reference_count = "0"
+            audio_reference_count = "0"
+        else:
+            _require_contiguous_slots(
+                [ref_audio_0, ref_audio_1, ref_audio_2], audio_reference_count,
+                "Standalone audio references",
+            )
         ref_videos = {}
         video_fps = {}
         video_components = {}
@@ -224,6 +287,7 @@ class MiniMaxH3ReferenceBundle(io.ComfyNode):
         audio_values = [ref_video_audio_0, ref_video_audio_1, ref_video_audio_2]
         active_video_audio_count = max(0, int(video_audio_reference_count))
         _require_contiguous_slots(audio_values, active_video_audio_count, "Video-paired audio references")
+        selected_video_audio_sources = set()
         for audio_slot, source in enumerate(audio_values[:active_video_audio_count]):
             video_index = _video_source_index(source)
             if video_index is None:
@@ -235,14 +299,49 @@ class MiniMaxH3ReferenceBundle(io.ComfyNode):
                     f"Video-paired audio {audio_slot + 1} points to Video reference {video_index + 1}, "
                     f"but only {active_video_count} video reference(s) are enabled."
                 )
+            if video_index in selected_video_audio_sources:
+                raise ValueError(
+                    f"Video reference {video_index + 1} was selected more than once as paired audio. "
+                    "Each video can contribute only one H3 <Audio N> reference."
+                )
+            selected_video_audio_sources.add(video_index)
             components = video_components.get(video_index)
             soundtrack = None if components is None else components.audio
-            if soundtrack is not None:
-                # H3 pairs the soundtrack by the source video's slot index.
-                ref_video_audios[f"ref_video_audio_{video_index}"] = soundtrack
+            if soundtrack is None:
+                raise ValueError(
+                    f"Video reference {video_index + 1} has no decodable audio track, but it was "
+                    "enabled as a paired audio reference. Disable that audio slot or choose a video with audio."
+                )
+            # H3 pairs the soundtrack by the source video's slot index. Audio
+            # ordinals are assigned later by video presentation order.
+            ref_video_audios[f"ref_video_audio_{video_index}"] = soundtrack
         ref_audios = _file_refs(
             [ref_audio_0, ref_audio_1, ref_audio_2],
             "ref_audio_", _load_audio_file, audio_reference_count)
+        presentation_order = []
+        for image_ordinal, slot_name in enumerate(ref_images, 1):
+            presentation_order.append({"tag": f"<Picture {image_ordinal}>", "slot": slot_name})
+        audio_ordinal = 0
+        audio_reference_order = []
+        for video_ordinal, slot_name in enumerate(ref_videos, 1):
+            suffix = slot_name.rsplit("_", 1)[-1]
+            audio_key = f"ref_video_audio_{suffix}"
+            if audio_key in ref_video_audios:
+                audio_ordinal += 1
+                item = {
+                    "tag": f"<Audio {audio_ordinal}>",
+                    "slot": audio_key,
+                    "paired_with": f"<Video {video_ordinal}>",
+                }
+                presentation_order.append(item)
+                audio_reference_order.append(item)
+            presentation_order.append({"tag": f"<Video {video_ordinal}>", "slot": slot_name})
+        for slot_name in ref_audios:
+            audio_ordinal += 1
+            item = {"tag": f"<Audio {audio_ordinal}>", "slot": slot_name}
+            presentation_order.append(item)
+            audio_reference_order.append(item)
+
         bundle = {
             "__type__": "minimax_h3_reference_bundle",
             "ref_images": ref_images,
@@ -250,6 +349,9 @@ class MiniMaxH3ReferenceBundle(io.ComfyNode):
             "video_fps": video_fps,
             "ref_video_audios": ref_video_audios,
             "ref_audios": ref_audios,
+            "generate_audio_without_reference": bool(generate_audio_without_reference),
+            "presentation_order": presentation_order,
+            "audio_reference_order": audio_reference_order,
             "reference_order": {
                 "images": list(ref_images),
                 "videos": list(ref_videos),
@@ -260,6 +362,126 @@ class MiniMaxH3ReferenceBundle(io.ComfyNode):
         bundle["has_references"] = any(bundle[key] for key in (
             "ref_images", "ref_videos", "ref_video_audios", "ref_audios"))
         return io.NodeOutput(bundle)
+
+
+class MiniMaxH3ReferenceInputManager(io.ComfyNode):
+    """Metadata-only control panel for the socket-based H3 reference router.
+
+    This node deliberately does not decode images, videos, or audio and does not
+    build a reference bundle.  It only exposes the selected input filenames and
+    counts so that ordinary VHS/Core loader nodes inside a subgraph can load and
+    route each slot directly into MiniMaxH3ReferenceToVideo.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        outputs = [
+            io.Int.Output("image_count", display_name="image_count"),
+            io.Int.Output("video_count", display_name="video_count"),
+            io.Int.Output("video_audio_count", display_name="video_audio_count"),
+            io.Int.Output("audio_count", display_name="audio_count"),
+        ]
+        outputs.extend(
+            io.String.Output(f"image_{index}_path", display_name=f"image_{index}")
+            for index in range(1, 10)
+        )
+        outputs.extend(
+            io.String.Output(f"video_{index}_path", display_name=f"video_{index}")
+            for index in range(1, 4)
+        )
+        outputs.extend(
+            io.Int.Output(
+                f"video_audio_{index}_source",
+                display_name=f"video_audio_{index}_source",
+            )
+            for index in range(1, 4)
+        )
+        outputs.extend(
+            io.String.Output(f"audio_{index}_path", display_name=f"audio_{index}")
+            for index in range(1, 4)
+        )
+        outputs.append(
+            io.Boolean.Output(
+                "generate_audio_without_reference",
+                display_name="generate_audio_without_reference",
+            )
+        )
+        return io.Schema(
+            node_id="MiniMaxH3ReferenceInputManager",
+            display_name="MiniMax H3 Reference Input Manager",
+            category="model/conditioning/minimax",
+            description=(
+                "Metadata-only reference control panel. Select files and counts; "
+                "the actual VHS/Core loader and slot switches live inside the subgraph."
+            ),
+            inputs=[
+                io.Combo.Input("image_reference_count", options=[str(i) for i in range(10)], default="2"),
+                io.Combo.Input("video_reference_count", options=[str(i) for i in range(4)], default="1"),
+                io.Combo.Input("video_audio_reference_count", options=[str(i) for i in range(4)], default="1"),
+                io.Combo.Input("audio_reference_count", options=[str(i) for i in range(4)], default="0"),
+                io.Boolean.Input(
+                    "generate_audio_without_reference",
+                    default=False,
+                    display_name="Generate audio without references",
+                ),
+                *_upload_inputs("ref_image_", "Image reference", IMAGE_FILES, io.UploadType.image, 9,
+                                "Filename is forwarded to the matching loader inside the subgraph."),
+                *_upload_inputs("ref_video_", "Video reference", VIDEO_FILES, io.UploadType.video, 3,
+                                "Filename is forwarded to the matching VHS loader inside the subgraph."),
+                *_video_audio_inputs(3),
+                *_upload_inputs("ref_audio_", "Audio reference", AUDIO_FILES, io.UploadType.audio, 3,
+                                "Filename is forwarded to the matching VHS audio loader inside the subgraph."),
+            ],
+            outputs=outputs,
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        image_reference_count="2",
+        video_reference_count="1",
+        video_audio_reference_count="1",
+        audio_reference_count="0",
+        generate_audio_without_reference=False,
+        ref_image_0="", ref_image_1="", ref_image_2="", ref_image_3="", ref_image_4="",
+        ref_image_5="", ref_image_6="", ref_image_7="", ref_image_8="",
+        ref_video_0="", ref_video_1="", ref_video_2="",
+        ref_video_audio_0="", ref_video_audio_1="", ref_video_audio_2="",
+        ref_audio_0="", ref_audio_1="", ref_audio_2="",
+    ):
+        def selected_path(value):
+            value = _file_value(value)
+            return folder_paths.get_annotated_filepath(value) if value else ""
+
+        image_count = max(0, min(int(image_reference_count), 9))
+        video_count = max(0, min(int(video_reference_count), 3))
+        video_audio_count = max(0, min(int(video_audio_reference_count), 3, video_count))
+        audio_count = max(0, min(int(audio_reference_count), 3))
+        image_paths = [selected_path(value) for value in (
+            ref_image_0, ref_image_1, ref_image_2, ref_image_3, ref_image_4,
+            ref_image_5, ref_image_6, ref_image_7, ref_image_8,
+        )]
+        video_paths = [selected_path(value) for value in (ref_video_0, ref_video_1, ref_video_2)]
+        # Paired audio is selected from an already-loaded reference video; no
+        # second upload is needed.  Return one-based source indices (0 means
+        # disabled) so the subgraph can route the native VHS audio outputs.
+        video_audio_sources = []
+        for value in (ref_video_audio_0, ref_video_audio_1, ref_video_audio_2):
+            source_index = _video_source_index(value)
+            source_number = source_index + 1 if source_index is not None else 0
+            video_audio_sources.append(source_number if source_number <= video_count else 0)
+        audio_paths = [selected_path(value) for value in (ref_audio_0, ref_audio_1, ref_audio_2)]
+        return io.NodeOutput(
+            image_count,
+            video_count,
+            video_audio_count,
+            audio_count,
+            *image_paths,
+            *video_paths,
+            *video_audio_sources,
+            *audio_paths,
+            bool(generate_audio_without_reference),
+        )
 
 
 def _preprocess_reference_frames(frames, source_fps, target_fps, frame_load_cap,
@@ -419,6 +641,8 @@ class MiniMaxH3ReferenceManager(MiniMaxH3ReferenceToVideo):
                            tooltip="Number of audio tracks paired with reference videos (0-3)."),
             io.Combo.Input("audio_reference_count", options=[str(i) for i in range(4)], default="0",
                            tooltip="Number of standalone audio references to use (0-3)."),
+            io.Boolean.Input("generate_audio_without_reference", default=False,
+                             display_name="Generate audio without references"),
             io.AnyType.Input("reference_bundle", optional=True,
                              tooltip="Reference bundle from MiniMax H3 Reference Bundle."),
         ])
@@ -429,10 +653,10 @@ class MiniMaxH3ReferenceManager(MiniMaxH3ReferenceToVideo):
                 audio_vae=None, ref_images=None, ref_videos=None, ref_video_audios=None,
                 ref_audios=None, image_reference_count="2", video_reference_count="1",
                 video_audio_reference_count="1", audio_reference_count="0",
+                generate_audio_without_reference=False,
                 reference_bundle=None):
         bundle_is_active = (isinstance(reference_bundle, dict)
-                and reference_bundle.get("__type__") == "minimax_h3_reference_bundle"
-                and reference_bundle.get("has_references"))
+                and reference_bundle.get("__type__") == "minimax_h3_reference_bundle")
         if bundle_is_active:
             ref_images = reference_bundle.get("ref_images") or {}
             ref_videos = reference_bundle.get("ref_videos") or {}
@@ -446,12 +670,26 @@ class MiniMaxH3ReferenceManager(MiniMaxH3ReferenceToVideo):
             selected_videos = ref_videos
             selected_video_audios = ref_video_audios
             selected_audios = ref_audios
+            generate_audio_without_reference = bool(
+                reference_bundle.get("generate_audio_without_reference", False)
+            )
         else:
             selected_images = _limit_refs(ref_images, "ref_image_", image_reference_count)
             selected_videos = _limit_refs(ref_videos, "ref_video_", video_reference_count)
             selected_video_audios = _limit_refs(
                 ref_video_audios, "ref_video_audio_", video_audio_reference_count)
             selected_audios = _limit_refs(ref_audios, "ref_audio_", audio_reference_count)
+            if generate_audio_without_reference:
+                selected_video_audios = {}
+                selected_audios = {}
+
+        prompt = _prepare_prompt(
+            prompt,
+            len(selected_images or {}),
+            len(selected_videos or {}),
+            len(selected_video_audios or {}) + len(selected_audios or {}),
+            generate_audio_without_reference,
+        )
         return super().execute(
             clip=clip,
             prompt=prompt,
@@ -470,12 +708,14 @@ class MiniMaxH3ReferenceManager(MiniMaxH3ReferenceToVideo):
 
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3ReferenceBundle": MiniMaxH3ReferenceBundle,
+    "MiniMaxH3ReferenceInputManager": MiniMaxH3ReferenceInputManager,
     "MiniMaxH3ReferenceVideoPreprocessor": MiniMaxH3ReferenceVideoPreprocessor,
     "MiniMaxH3ReferenceManager": MiniMaxH3ReferenceManager,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3ReferenceBundle": "MiniMax H3 Reference Bundle (9/3/3/3)",
+    "MiniMaxH3ReferenceInputManager": "MiniMax H3 Reference Input Manager",
     "MiniMaxH3ReferenceVideoPreprocessor": "MiniMax H3 Reference Video Preprocessor",
     "MiniMaxH3ReferenceManager": "MiniMax H3 Reference Manager (9/3/3/3)",
 }
