@@ -58,8 +58,15 @@ ComfyUI/custom_nodes/ComfyUI-MiniMax-H3-Reference-Manager
 
 Restart ComfyUI and search for **MiniMax H3 Reference Manager (9/3/3/3)**.
 
-The tested two-phase workflow is included at
-`workflows/minimax_h3_two_phase_socket_refs.json`.
+The tested workflows are included in `workflows/`:
+
+- `minimax_h3_two_phase_socket_refs.json` — two-phase reference workflow.
+- `minimax_h3_ref2va_multiframe_reference.json` — two-phase workflow with timed multiframe guides.
+
+The Codex skill at `skills/minimax-h3-ref2va-multiframe/SKILL.md` explains
+how to prepare guide images, map prompt references, write the H3 prompt, and
+run the multiframe workflow. Copy the skill folder into your Codex skills
+directory to install it.
 
 The node requires a ComfyUI build that provides `comfy_api.latest` and the
 native MiniMax H3 nodes. No extra Python packages are required.
