@@ -13,6 +13,7 @@ from aiohttp import web
 
 import folder_paths
 import nodes
+import node_helpers
 import torch
 import comfy.utils
 from comfy_api.latest import InputImpl
@@ -36,6 +37,7 @@ VIDEO_AUDIO_SOURCES = ["", "Video reference 1", "Video reference 2", "Video refe
 REFERENCE_VIDEO_MIN_SHORT_EDGE = 480
 REFERENCE_VIDEO_MAX_SHORT_EDGE = 720
 REFERENCE_VIDEO_MULTIPLE = 32
+MULTIFRAME_GUIDE_DEFAULT_SECONDS = (0.0, 1.5, 3.0, 4.5, 6.0)
 
 REFERENCE_TAG_RE = re.compile(r"<(Picture|Video|Audio)\s+(\d+)>", re.IGNORECASE)
 
@@ -105,6 +107,7 @@ def _validate_reference_inputs(values):
         video_count = int(values.get("video_reference_count", 0))
         video_audio_count = int(values.get("video_audio_reference_count", 0))
         audio_count = int(values.get("audio_reference_count", 0))
+        guide_count = int(values.get("multiframe_reference_count", 0))
     except (TypeError, ValueError):
         return "Reference counts must be whole numbers."
 
@@ -113,6 +116,7 @@ def _validate_reference_inputs(values):
         ("video_reference_count", video_count, 3),
         ("video_audio_reference_count", video_audio_count, 3),
         ("audio_reference_count", audio_count, 3),
+        ("multiframe_reference_count", guide_count, 5),
     )
     for name, count, maximum in limits:
         if count < 0 or count > maximum:
@@ -132,6 +136,18 @@ def _validate_reference_inputs(values):
             values.get(f"ref_video_{index}"),
             f"Video reference {index + 1}",
             ["video"],
+        )
+        if result is not True:
+            return result
+
+    for index in range(1, guide_count + 1):
+        value = values.get(f"guide_image_{index}")
+        if _file_value(value) is None:
+            return f"Multiframe guide {index} requires an image."
+        result = _validate_reference_file(
+            value,
+            f"Multiframe guide {index}",
+            ["image"],
         )
         if result is not True:
             return result
@@ -261,6 +277,42 @@ def _video_audio_inputs(max_count=3):
     ]
 
 
+def _multiframe_guide_inputs():
+    inputs = [
+        io.Combo.Input(
+            "multiframe_reference_count",
+            options=[str(i) for i in range(6)],
+            default="0",
+            display_name="Multiframe reference count",
+            tooltip="Number of consecutive multiframe guide slots to use (0-5).",
+        )
+    ]
+    image_options = _files(["image"])
+    for index, default_time in enumerate(MULTIFRAME_GUIDE_DEFAULT_SECONDS, 1):
+        inputs.extend([
+            io.Combo.Input(
+                f"guide_image_{index}",
+                options=image_options,
+                display_name=f"Guide image {index}",
+                optional=True,
+                default="",
+                upload=io.UploadType.image,
+                socketless=True,
+                tooltip="Dedicated image for the matching MiniMax H3 multiframe guide.",
+            ),
+            io.Float.Input(
+                f"guide_time_seconds_{index}",
+                default=default_time,
+                min=0.0,
+                max=86400.0,
+                step=0.1,
+                display_name=f"Guide {index} time (seconds)",
+                tooltip="Converted inside the workflow with frame_idx = round(seconds * 24).",
+            ),
+        ])
+    return inputs
+
+
 def _video_source_index(value):
     """Convert 'Video reference N' to its zero-based reference-video index."""
     if not isinstance(value, str):
@@ -317,6 +369,73 @@ def _prepare_prompt(prompt, image_count, video_count, audio_count,
             + ". H3 numbers Picture, Video, and Audio independently in presentation order."
         )
     return prompt
+
+
+def _reference_name(value):
+    value = _file_value(value)
+    return os.path.basename(value) if value else "(not selected)"
+
+
+def _prompt_reference_map(image_paths, video_paths, video_audio_sources,
+                          audio_paths, guide_paths, guide_times,
+                          generate_audio_without_reference=False):
+    lines = [
+        "MiniMax H3 prompt reference map",
+        "Pictures are numbered in presentation order: image references first, then multiframe guides.",
+    ]
+
+    picture_number = 0
+    for index, path in enumerate(image_paths, 1):
+        if not path:
+            continue
+        picture_number += 1
+        lines.append(
+            f"<Picture {picture_number}> = Image reference {index}: {_reference_name(path)}"
+        )
+    for index, (path, seconds) in enumerate(zip(guide_paths, guide_times), 1):
+        if not path:
+            continue
+        picture_number += 1
+        frame = round(float(seconds) * 24)
+        lines.append(
+            f"<Picture {picture_number}> = Multiframe guide {index}: {_reference_name(path)} "
+            f"at {float(seconds):g}s (frame {frame})"
+        )
+    if picture_number == 0:
+        lines.append("Pictures: none")
+
+    for index, path in enumerate(video_paths, 1):
+        if path:
+            lines.append(f"<Video {index}> = Video reference {index}: {_reference_name(path)}")
+
+    if generate_audio_without_reference:
+        lines.append("Audio: generated by H3; do not use <Audio N> tags.")
+    else:
+        audio_number = 0
+        selected_video_sources = set(video_audio_sources)
+        for video_index, path in enumerate(video_paths, 1):
+            if path and video_index in selected_video_sources:
+                audio_number += 1
+                lines.append(
+                    f"<Audio {audio_number}> = Audio from Video reference {video_index}: "
+                    f"{_reference_name(path)}"
+                )
+        for index, path in enumerate(audio_paths, 1):
+            if not path:
+                continue
+            audio_number += 1
+            lines.append(
+                f"<Audio {audio_number}> = Standalone audio reference {index}: {_reference_name(path)}"
+            )
+        if audio_number == 0:
+            lines.append("Audio references: none")
+
+    lines.extend([
+        "",
+        "Prompt rule: use each <Picture N> exactly as listed above. A multiframe guide is both a "
+        "vision reference for that Picture number and a timed keyframe anchor.",
+    ])
+    return "\n".join(lines)
 
 
 class MiniMaxH3ReferenceBundle(io.ComfyNode):
@@ -535,6 +654,24 @@ class MiniMaxH3ReferenceInputManager(io.ComfyNode):
                 display_name="generate_audio_without_reference",
             )
         )
+        outputs.append(io.Int.Output("guide_count", display_name="guide_count"))
+        outputs.extend(
+            io.String.Output(f"guide_{index}_path", display_name=f"guide_{index}")
+            for index in range(1, 6)
+        )
+        outputs.extend(
+            io.Float.Output(
+                f"guide_{index}_time_seconds",
+                display_name=f"guide_{index}_time_seconds",
+            )
+            for index in range(1, 6)
+        )
+        outputs.append(
+            io.String.Output(
+                "prompt_reference_map",
+                display_name="prompt_reference_map",
+            )
+        )
         return io.Schema(
             node_id="MiniMaxH3ReferenceInputManager",
             display_name="MiniMax H3 Reference Input Manager",
@@ -560,6 +697,7 @@ class MiniMaxH3ReferenceInputManager(io.ComfyNode):
                 *_video_audio_inputs(3),
                 *_upload_inputs("ref_audio_", "Audio reference", _files(["audio", "video"]), io.UploadType.audio, 3,
                                 "Filename is forwarded to the matching VHS audio loader inside the subgraph."),
+                *_multiframe_guide_inputs(),
             ],
             outputs=outputs,
         )
@@ -577,6 +715,12 @@ class MiniMaxH3ReferenceInputManager(io.ComfyNode):
         ref_video_0="", ref_video_1="", ref_video_2="",
         ref_video_audio_0="", ref_video_audio_1="", ref_video_audio_2="",
         ref_audio_0="", ref_audio_1="", ref_audio_2="",
+        multiframe_reference_count="0",
+        guide_image_1="", guide_time_seconds_1=0.0,
+        guide_image_2="", guide_time_seconds_2=1.5,
+        guide_image_3="", guide_time_seconds_3=3.0,
+        guide_image_4="", guide_time_seconds_4=4.5,
+        guide_image_5="", guide_time_seconds_5=6.0,
     ):
         def selected_path(value):
             value = _file_value(value)
@@ -604,6 +748,21 @@ class MiniMaxH3ReferenceInputManager(io.ComfyNode):
             selected_path(value) if index < video_count else ""
             for index, value in enumerate(video_values)
         ]
+        guide_count = max(0, min(int(multiframe_reference_count), 5))
+        guide_values = (
+            guide_image_1, guide_image_2, guide_image_3, guide_image_4, guide_image_5,
+        )
+        guide_paths = [
+            selected_path(value) if index < guide_count else ""
+            for index, value in enumerate(guide_values)
+        ]
+        guide_times = [
+            float(guide_time_seconds_1),
+            float(guide_time_seconds_2),
+            float(guide_time_seconds_3),
+            float(guide_time_seconds_4),
+            float(guide_time_seconds_5),
+        ]
         # Paired audio is selected from an already-loaded reference video; no
         # second upload is needed.  Return one-based source indices (0 means
         # disabled) so the subgraph can route the native VHS audio outputs.
@@ -623,6 +782,15 @@ class MiniMaxH3ReferenceInputManager(io.ComfyNode):
                 selected_path(value) if index < audio_count else ""
                 for index, value in enumerate((ref_audio_0, ref_audio_1, ref_audio_2))
             ]
+        prompt_reference_map = _prompt_reference_map(
+            image_paths,
+            video_paths,
+            video_audio_sources,
+            audio_paths,
+            guide_paths,
+            guide_times,
+            audio_without_reference,
+        )
         return io.NodeOutput(
             image_count,
             video_count,
@@ -633,11 +801,43 @@ class MiniMaxH3ReferenceInputManager(io.ComfyNode):
             *video_audio_sources,
             *audio_paths,
             audio_without_reference,
+            guide_count,
+            *guide_paths,
+            *guide_times,
+            prompt_reference_map,
         )
 
     @classmethod
     def validate_inputs(cls, **kwargs):
         return _validate_reference_inputs(kwargs)
+
+
+class MiniMaxH3PromptReferenceGuide(io.ComfyNode):
+    """Display the exact H3 prompt labels produced by the input manager."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3PromptReferenceGuide",
+            display_name="MiniMax H3 Prompt Reference Guide",
+            category="model/conditioning/minimax",
+            description=(
+                "Shows the exact <Picture N>, <Video N>, and <Audio N> order. "
+                "Multiframe guides follow ordinary image references in Picture order."
+            ),
+            inputs=[
+                io.String.Input("reference_map", force_input=True),
+            ],
+            outputs=[
+                io.String.Output("reference_map", display_name="reference_map"),
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, reference_map):
+        reference_map = str(reference_map or "")
+        return io.NodeOutput(reference_map, ui={"text": [reference_map]})
 
 
 def _preprocess_reference_frames(frames, source_fps, target_fps, frame_load_cap,
@@ -778,6 +978,91 @@ class MiniMaxH3ReferenceVideoPreprocessor(io.ComfyNode):
         return io.NodeOutput(processed_bundle, layout_image)
 
 
+class MiniMaxH3ReferenceToVideoWithGuides(MiniMaxH3ReferenceToVideo):
+    """Expose timed guide images to Qwen Vision before anchoring them in the latent."""
+
+    @classmethod
+    def define_schema(cls):
+        schema = super().define_schema()
+        schema.node_id = "MiniMaxH3ReferenceToVideoWithGuides"
+        schema.display_name = "MiniMax H3 Reference to Video + Prompt Guides"
+        schema.description = (
+            "Reference images receive the first <Picture N> labels. Timed guide images "
+            "continue that numbering in Qwen Vision and are then anchored separately "
+            "with Add Guide nodes."
+        )
+        schema.inputs.append(
+            io.Autogrow.Input(
+                "guide_images",
+                optional=True,
+                template=io.Autogrow.TemplatePrefix(
+                    input=io.Image.Input(
+                        "guide_image",
+                        tooltip=(
+                            "Timed multiframe guide exposed to Qwen Vision. The same image "
+                            "must also be connected to Add Guide for its frame anchor."
+                        ),
+                    ),
+                    prefix="guide_image_",
+                    min=0,
+                    max=5,
+                ),
+            )
+        )
+        return schema
+
+    @classmethod
+    def execute(cls, clip, prompt, width, height, length, ref_image_size="match", vae=None,
+                audio_vae=None, ref_images=None, ref_videos=None,
+                ref_video_audios=None, ref_audios=None, guide_images=None):
+        semantic_images = [
+            image for image in (ref_images or {}).values()
+            if image is not None
+        ]
+        timed_guides = [
+            image for image in (guide_images or {}).values()
+            if image is not None
+        ]
+        combined_images = {
+            f"ref_image_{index}": image
+            for index, image in enumerate((*semantic_images, *timed_guides))
+        }
+        output = super().execute(
+            clip=clip,
+            prompt=prompt,
+            width=width,
+            height=height,
+            length=length,
+            ref_image_size=ref_image_size,
+            vae=vae,
+            audio_vae=audio_vae,
+            ref_images=combined_images,
+            ref_videos=ref_videos,
+            ref_video_audios=ref_video_audios,
+            ref_audios=ref_audios,
+        )
+        positive, latent = output.result
+
+        if timed_guides and positive:
+            refs = list(positive[0][1].get("minimax_refs", []))
+            kept_refs = []
+            image_index = 0
+            guide_start = len(semantic_images)
+            guide_end = guide_start + len(timed_guides)
+            for ref in refs:
+                if ref.get("kind") == "image":
+                    if not guide_start <= image_index < guide_end:
+                        kept_refs.append(ref)
+                    image_index += 1
+                else:
+                    kept_refs.append(ref)
+            positive = node_helpers.conditioning_set_values(
+                positive,
+                {"minimax_refs": kept_refs},
+            )
+        return io.NodeOutput(positive, latent)
+
+
 class MiniMaxH3ReferenceManager(MiniMaxH3ReferenceToVideo):
     """Official H3 reference conditioning plus count dropdowns."""
 
@@ -868,6 +1153,8 @@ class MiniMaxH3ReferenceManager(MiniMaxH3ReferenceToVideo):
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3ReferenceBundle": MiniMaxH3ReferenceBundle,
     "MiniMaxH3ReferenceInputManager": MiniMaxH3ReferenceInputManager,
+    "MiniMaxH3PromptReferenceGuide": MiniMaxH3PromptReferenceGuide,
+    "MiniMaxH3ReferenceToVideoWithGuides": MiniMaxH3ReferenceToVideoWithGuides,
     "MiniMaxH3ReferenceVideoPreprocessor": MiniMaxH3ReferenceVideoPreprocessor,
     "MiniMaxH3ReferenceManager": MiniMaxH3ReferenceManager,
 }
@@ -875,6 +1162,8 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3ReferenceBundle": "MiniMax H3 Reference Bundle (9/3/3/3)",
     "MiniMaxH3ReferenceInputManager": "MiniMax H3 Reference Input Manager",
+    "MiniMaxH3PromptReferenceGuide": "MiniMax H3 Prompt Reference Guide",
+    "MiniMaxH3ReferenceToVideoWithGuides": "MiniMax H3 Reference to Video + Prompt Guides",
     "MiniMaxH3ReferenceVideoPreprocessor": "MiniMax H3 Reference Video Preprocessor",
     "MiniMaxH3ReferenceManager": "MiniMax H3 Reference Manager (9/3/3/3)",
 }

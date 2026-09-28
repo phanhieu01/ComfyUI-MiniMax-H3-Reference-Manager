@@ -5,6 +5,7 @@ const NODE_NAMES = new Set([
   "MiniMaxH3ReferenceBundle",
   "MiniMaxH3ReferenceInputManager",
 ]);
+const PROMPT_GUIDE_NODE = "MiniMaxH3PromptReferenceGuide";
 const FILE_REFRESH_ROUTE = "/minimax_h3_reference_manager/files";
 
 const GROUPS = [
@@ -12,7 +13,32 @@ const GROUPS = [
   { count: "video_reference_count", prefix: "ref_video_", max: 3, fileKind: "video", previewKind: "video" },
   { count: "video_audio_reference_count", prefix: "ref_video_audio_", max: 3, audioOnly: true, paired: true, previewKind: "audio" },
   { count: "audio_reference_count", prefix: "ref_audio_", max: 3, fileKind: "audio", audioOnly: true, previewKind: "audio" },
+  {
+    count: "multiframe_reference_count",
+    prefix: "guide_image_",
+    timePrefix: "guide_time_seconds_",
+    max: 5,
+    start: 1,
+    fileKind: "image",
+    previewKind: "image",
+    label: "Guide image",
+    inputManagerOnly: true,
+  },
 ];
+
+function referenceGroups(node) {
+  return GROUPS.filter(
+    (spec) => !spec.inputManagerOnly || node.type === "MiniMaxH3ReferenceInputManager",
+  );
+}
+
+function slotNumber(spec, index) {
+  return index + (spec.start || 0);
+}
+
+function slotWidgetName(spec, index) {
+  return `${spec.prefix}${slotNumber(spec, index)}`;
+}
 
 function countValue(node, name, max) {
   const widget = (node.widgets || []).find((candidate) => candidate.name === name);
@@ -100,7 +126,7 @@ function inactiveReferenceValues(node) {
 }
 
 function syncReferenceValue(node, spec, index, active) {
-  const name = `${spec.prefix}${index}`;
+  const name = slotWidgetName(spec, index);
   const widget = (node.widgets || []).find((candidate) => candidate.name === name);
   if (!widget) return;
 
@@ -148,7 +174,8 @@ function createMediaElement(kind) {
 }
 
 function ensurePreviewWidget(node, spec, index) {
-  const name = `h3_reference_preview_${spec.prefix}${index}`;
+  const slot = slotNumber(spec, index);
+  const name = `h3_reference_preview_${spec.prefix}${slot}`;
   let preview = (node.widgets || []).find((candidate) => candidate.name === name);
   if (!preview && typeof node.addDOMWidget === "function" && typeof document !== "undefined") {
     const element = document.createElement("div");
@@ -185,13 +212,14 @@ function ensurePreviewWidget(node, spec, index) {
       return [width, height];
     };
   }
-  if (preview) insertAfter(node, preview, `${spec.prefix}${index}`);
+  if (preview) insertAfter(node, preview, slotWidgetName(spec, index));
   return preview;
 }
 
 function previewSource(node, spec, index) {
+  const slot = slotNumber(spec, index);
   if (spec.paired) {
-    const match = String(valueFor(node, `${spec.prefix}${index}`) || "").match(/Video reference (\d+)/);
+    const match = String(valueFor(node, slotWidgetName(spec, index)) || "").match(/Video reference (\d+)/);
     if (!match) return { value: "", label: `Audio from video ${index + 1}` };
     const videoIndex = Number(match[1]) - 1;
     return {
@@ -200,13 +228,13 @@ function previewSource(node, spec, index) {
     };
   }
   return {
-    value: valueFor(node, `${spec.prefix}${index}`),
-    label: `${spec.previewKind === "image" ? "Image" : spec.previewKind === "video" ? "Video" : "Audio"} ${index + 1}`,
+    value: valueFor(node, slotWidgetName(spec, index)),
+    label: `${spec.label || (spec.previewKind === "image" ? "Image" : spec.previewKind === "video" ? "Video" : "Audio")} ${slot}`,
   };
 }
 
 function updateSlotPreviews(node) {
-  for (const spec of GROUPS) {
+  for (const spec of referenceGroups(node)) {
     const activeCount = countValue(node, spec.count, spec.max);
     for (let index = 0; index < spec.max; index += 1) {
       const preview = ensurePreviewWidget(node, spec, index);
@@ -283,24 +311,43 @@ function ensureSummaryWidget(node) {
   return summary;
 }
 
-function updateSummary(node) {
-  const summary = ensureSummaryWidget(node);
-  if (!summary) return;
-
-  const lines = ["Selected references:"];
+function promptReferenceText(node, includeStatus = false) {
+  const lines = [
+    "MiniMax H3 prompt reference map",
+    "Pictures: image references first, then multiframe guides.",
+  ];
   const imageCount = countValue(node, "image_reference_count", 9);
   const videoCount = countValue(node, "video_reference_count", 3);
   const noAudioReferences = audioReferencesDisabled(node);
   const audioCount = noAudioReferences ? 0 : countValue(node, "audio_reference_count", 3);
+  const guideCount = countValue(node, "multiframe_reference_count", 5);
 
+  let pictureOrdinal = 0;
   for (let index = 0; index < imageCount; index += 1) {
-    lines.push(`Image ${index + 1}: ${shortValue(valueFor(node, `ref_image_${index}`))}`);
+    pictureOrdinal += 1;
+    lines.push(
+      `<Picture ${pictureOrdinal}> = Image reference ${index + 1}: ` +
+      shortValue(valueFor(node, `ref_image_${index}`)),
+    );
   }
+  for (let index = 1; index <= guideCount; index += 1) {
+    pictureOrdinal += 1;
+    const image = shortValue(valueFor(node, `guide_image_${index}`));
+    const seconds = Number(valueFor(node, `guide_time_seconds_${index}`) || 0);
+    lines.push(
+      `<Picture ${pictureOrdinal}> = Multiframe guide ${index}: ${image} ` +
+      `at ${seconds}s (frame ${Math.round(seconds * 24)})`,
+    );
+  }
+  if (pictureOrdinal === 0) lines.push("Pictures: none");
   for (let index = 0; index < videoCount; index += 1) {
-    lines.push(`Video ${index + 1}: ${shortValue(valueFor(node, `ref_video_${index}`))}`);
+    lines.push(
+      `<Video ${index + 1}> = Video reference ${index + 1}: ` +
+      shortValue(valueFor(node, `ref_video_${index}`)),
+    );
   }
   if (noAudioReferences) {
-    lines.push("Audio mode: generate new H3 audio (external audio references disabled)");
+    lines.push("Audio: generated by H3; do not use <Audio N> tags.");
   } else {
     const paired = pairedAudioByVideo(node);
     let audioOrdinal = 0;
@@ -308,30 +355,114 @@ function updateSummary(node) {
       audioOrdinal += 1;
       const sourceFile = valueFor(node, `ref_video_${entry.videoIndex}`);
       lines.push(
-        `Audio ${audioOrdinal} (paired before Video ${entry.videoIndex + 1}): ` +
-        `${entry.source}${sourceFile ? ` (${shortValue(sourceFile)})` : " (not loaded)"}`,
+        `<Audio ${audioOrdinal}> = Audio from Video reference ${entry.videoIndex + 1}: ` +
+        `${sourceFile ? shortValue(sourceFile) : "—"}`,
       );
     }
     for (let index = 0; index < audioCount; index += 1) {
       audioOrdinal += 1;
-      lines.push(`Audio ${audioOrdinal}: ${shortValue(valueFor(node, `ref_audio_${index}`))}`);
+      lines.push(
+        `<Audio ${audioOrdinal}> = Standalone audio reference ${index + 1}: ` +
+        shortValue(valueFor(node, `ref_audio_${index}`)),
+      );
     }
+    if (audioOrdinal === 0) lines.push("Audio references: none");
     for (const warning of paired.warnings) lines.push(`Warning: ${warning}`);
   }
-  if (node._h3ReferenceStatus) lines.push(`Status: ${node._h3ReferenceStatus}`);
+  lines.push("Use every <Picture N> exactly as listed above in the prompt.");
+  if (includeStatus && node._h3ReferenceStatus) {
+    lines.push(`Status: ${node._h3ReferenceStatus}`);
+  }
+  return lines.join("\n");
+}
 
-  const text = lines.join("\n");
+function updateSummary(node) {
+  const summary = ensureSummaryWidget(node);
+  if (!summary) return;
+
+  const text = promptReferenceText(node, true);
   summary.value = text;
   if (summary._h3SummaryText) summary._h3SummaryText.textContent = text;
   else if (summary._h3SummaryElement) summary._h3SummaryElement.textContent = text;
 }
 
+function graphLink(linkId) {
+  const links = app.graph?.links;
+  if (!links || linkId == null) return null;
+  return typeof links.get === "function" ? links.get(linkId) : links[linkId];
+}
+
+function promptGuideSource(node) {
+  const input = (node.inputs || []).find((candidate) => candidate.name === "reference_map");
+  const link = graphLink(input?.link);
+  const originId = link?.origin_id ?? link?.originId;
+  return originId == null ? null : app.graph?.getNodeById?.(originId);
+}
+
+function ensurePromptGuideWidget(node) {
+  let widget = (node.widgets || []).find(
+    (candidate) => candidate.name === "h3_prompt_reference_guide",
+  );
+  if (!widget && typeof node.addDOMWidget === "function" && typeof document !== "undefined") {
+    const element = document.createElement("pre");
+    element.style.cssText = [
+      "margin:0",
+      "padding:8px",
+      "min-height:240px",
+      "box-sizing:border-box",
+      "overflow:auto",
+      "white-space:pre-wrap",
+      "word-break:break-word",
+      "font:11px/1.45 monospace",
+      "color:#ddd",
+      "background:rgba(0,0,0,.24)",
+      "border:1px solid rgba(255,255,255,.12)",
+      "border-radius:4px",
+    ].join(";");
+    widget = node.addDOMWidget(
+      "h3_prompt_reference_guide",
+      "H3_PROMPT_REFERENCE_GUIDE",
+      element,
+      {
+        serialize: false,
+        getValue() { return element.textContent || ""; },
+        setValue(value) { element.textContent = value || ""; },
+        getMinHeight: () => 260,
+        getHeight: () => 300,
+      },
+    );
+    widget._h3PromptGuideElement = element;
+  }
+  return widget;
+}
+
+function updatePromptGuideNode(node, executedText = "") {
+  const widget = ensurePromptGuideWidget(node);
+  if (!widget) return;
+  const source = promptGuideSource(node);
+  const text = source?.type === "MiniMaxH3ReferenceInputManager"
+    ? promptReferenceText(source)
+    : executedText || "Connect prompt_reference_map from the Reference Manager.";
+  widget.value = text;
+  if (widget._h3PromptGuideElement) widget._h3PromptGuideElement.textContent = text;
+  node.setSize([Math.max(node.size?.[0] || 0, 540), Math.max(node.size?.[1] || 0, 340)]);
+  node.setDirtyCanvas(true, true);
+}
+
+function updateLinkedPromptGuides(source) {
+  for (const node of app.graph?._nodes || []) {
+    if (node.type === PROMPT_GUIDE_NODE && promptGuideSource(node) === source) {
+      updatePromptGuideNode(node);
+    }
+  }
+}
+
 function syncReferenceWidgets(node) {
   const noAudioReferences = audioReferencesDisabled(node);
-  for (const spec of GROUPS) {
+  for (const spec of referenceGroups(node)) {
     const countWidget = (node.widgets || []).find((candidate) => candidate.name === spec.count);
-    if (countWidget && spec.audioOnly) {
-      setWidgetHidden(countWidget, noAudioReferences);
+    if (countWidget) {
+      setWidgetHidden(countWidget, Boolean(spec.audioOnly && noAudioReferences));
     }
     let wanted = countValue(node, spec.count, spec.max);
     if (spec.paired) {
@@ -339,12 +470,18 @@ function syncReferenceWidgets(node) {
     }
     for (let index = 0; index < spec.max; index += 1) {
       const widget = (node.widgets || []).find(
-        (candidate) => candidate.name === `${spec.prefix}${index}`,
+        (candidate) => candidate.name === slotWidgetName(spec, index),
       );
       if (!widget) continue;
       const hidden = index >= wanted || (spec.audioOnly && noAudioReferences);
       syncReferenceValue(node, spec, index, !hidden);
       setWidgetHidden(widget, hidden);
+      if (spec.timePrefix) {
+        const timeWidget = (node.widgets || []).find(
+          (candidate) => candidate.name === `${spec.timePrefix}${slotNumber(spec, index)}`,
+        );
+        setWidgetHidden(timeWidget, hidden);
+      }
     }
   }
 
@@ -353,7 +490,7 @@ function syncReferenceWidgets(node) {
   for (let index = (node.inputs || []).length - 1; index >= 0; index -= 1) {
     const slot = node.inputs[index];
     if (!slot || slot.link) continue;
-    if (GROUPS.some((spec) => slot.name?.startsWith(`${spec.prefix}`) ||
+    if (referenceGroups(node).some((spec) => slot.name?.startsWith(`${spec.prefix}`) ||
       slot.name?.startsWith(`${spec.prefix.replace(/_$/, "s.")}`))) {
       node.removeInput(index);
     }
@@ -361,6 +498,7 @@ function syncReferenceWidgets(node) {
 
   updateSlotPreviews(node);
   updateSummary(node);
+  updateLinkedPromptGuides(node);
   node.setSize(node.computeSize());
   node.setDirtyCanvas(true, true);
 }
@@ -370,19 +508,22 @@ function stripInactiveReferenceInputs(node, inputs) {
   const noAudioReferences = audioReferencesDisabled(node);
   const videoCount = countValue(node, "video_reference_count", 3);
 
-  for (const spec of GROUPS) {
+  for (const spec of referenceGroups(node)) {
     let activeCount = countValue(node, spec.count, spec.max);
     if (spec.paired) activeCount = Math.min(activeCount, videoCount);
     for (let index = 0; index < spec.max; index += 1) {
       if (index >= activeCount || (spec.audioOnly && noAudioReferences)) {
-        delete inputs[`${spec.prefix}${index}`];
+        delete inputs[slotWidgetName(spec, index)];
+        if (spec.timePrefix) {
+          delete inputs[`${spec.timePrefix}${slotNumber(spec, index)}`];
+        }
       }
     }
   }
 }
 
 function hookCountWidgets(node) {
-  for (const spec of GROUPS) {
+  for (const spec of referenceGroups(node)) {
     const widget = (node.widgets || []).find((candidate) => candidate.name === spec.count);
     if (!widget || widget._h3ReferenceUploadHooked) continue;
     const callback = widget.callback;
@@ -406,10 +547,10 @@ function hookCountWidgets(node) {
 }
 
 function hookReferenceWidgets(node) {
-  for (const spec of GROUPS) {
+  for (const spec of referenceGroups(node)) {
     for (let index = 0; index < spec.max; index += 1) {
       const widget = (node.widgets || []).find(
-        (candidate) => candidate.name === `${spec.prefix}${index}`,
+        (candidate) => candidate.name === slotWidgetName(spec, index),
       );
       if (!widget || widget._h3ReferenceValueHooked) continue;
       const callback = widget.callback;
@@ -439,7 +580,7 @@ function ensureRefreshWidget(node) {
 function updateFileWidgetOptions(node, spec, values) {
   for (let index = 0; index < spec.max; index += 1) {
     const widget = (node.widgets || []).find(
-      (candidate) => candidate.name === `${spec.prefix}${index}`,
+      (candidate) => candidate.name === slotWidgetName(spec, index),
     );
     if (!widget) continue;
     widget.options = { ...(widget.options || {}), values: [...values] };
@@ -460,7 +601,7 @@ async function refreshFileOptions(node) {
       const response = await fetch(api.apiURL(FILE_REFRESH_ROUTE), { cache: "no-store" });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const files = await response.json();
-      for (const spec of GROUPS) {
+      for (const spec of referenceGroups(node)) {
         if (spec.fileKind) {
           updateFileWidgetOptions(
             node,
@@ -490,14 +631,24 @@ function scheduleFileRefresh(node) {
   }, 180);
 }
 
-function prepareNode(node) {
+function restoreNamedWidgetValues(node, values) {
+  if (!values || typeof values !== "object") return;
+  for (const widget of node.widgets || []) {
+    if (Object.prototype.hasOwnProperty.call(values, widget.name)) {
+      widget.value = values[widget.name];
+    }
+  }
+}
+
+function prepareNode(node, namedValues) {
   ensureRefreshWidget(node);
-  for (const spec of GROUPS) {
+  for (const spec of referenceGroups(node)) {
     for (let index = 0; index < spec.max; index += 1) {
       ensurePreviewWidget(node, spec, index);
     }
   }
   ensureSummaryWidget(node);
+  restoreNamedWidgetValues(node, namedValues);
   hookCountWidgets(node);
   hookReferenceWidgets(node);
   syncReferenceWidgets(node);
@@ -522,19 +673,50 @@ app.registerExtension({
     };
   },
   async beforeRegisterNodeDef(nodeType, nodeData) {
+    if (nodeData.name === PROMPT_GUIDE_NODE) {
+      const onNodeCreated = nodeType.prototype.onNodeCreated;
+      nodeType.prototype.onNodeCreated = function () {
+        const result = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
+        queueMicrotask(() => updatePromptGuideNode(this));
+        return result;
+      };
+
+      const onConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function () {
+        const result = onConfigure ? onConfigure.apply(this, arguments) : undefined;
+        queueMicrotask(() => updatePromptGuideNode(this));
+        return result;
+      };
+
+      const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+      nodeType.prototype.onConnectionsChange = function () {
+        const result = onConnectionsChange ? onConnectionsChange.apply(this, arguments) : undefined;
+        queueMicrotask(() => updatePromptGuideNode(this));
+        return result;
+      };
+
+      const onExecuted = nodeType.prototype.onExecuted;
+      nodeType.prototype.onExecuted = function (message) {
+        const result = onExecuted ? onExecuted.apply(this, arguments) : undefined;
+        const text = Array.isArray(message?.text) ? message.text.join("\n") : message?.text;
+        updatePromptGuideNode(this, text || "");
+        return result;
+      };
+      return;
+    }
     if (!NODE_NAMES.has(nodeData.name)) return;
 
     const onNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       const result = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
-      prepareNode(this);
+      queueMicrotask(() => prepareNode(this));
       return result;
     };
 
     const onConfigure = nodeType.prototype.onConfigure;
     nodeType.prototype.onConfigure = function () {
       const result = onConfigure ? onConfigure.apply(this, arguments) : undefined;
-      prepareNode(this);
+      prepareNode(this, arguments[0]?.widgets_values_named);
       return result;
     };
   },
