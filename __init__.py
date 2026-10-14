@@ -307,6 +307,7 @@ def _multiframe_guide_inputs():
                 max=86400.0,
                 step=0.1,
                 display_name=f"Guide {index} time (seconds)",
+                optional=True,
                 tooltip="Converted inside the workflow with frame_idx = round(seconds * 24).",
             ),
         ])
